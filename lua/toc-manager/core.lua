@@ -2,259 +2,227 @@ local M = {}
 local config = require("toc-manager.config")
 local utils = require("toc-manager.utils")
 
-local clipboard = {
-  action = nil,
-  path = nil,
-  filename = nil
-}
+M.cwd = vim.fn.getcwd()
+M.last_yank = nil
+M.line_map = {}
 
--- 辅助函数：修改 Buffer 内容时的安全包装器
-local function modify_buffer(bufnr, callback)
-  if not vim.api.nvim_buf_is_valid(bufnr) then return end
-  
-  -- 1. 临时解锁
-  vim.bo[bufnr].modifiable = true
-  
-  -- 2. 执行修改操作
-  callback()
-  
-  -- 3. 修改完立即保存并锁定
-  vim.cmd('write')
-  vim.bo[bufnr].modifiable = false
-end
+-- =======================================================
+-- 1. 生成与渲染
+-- =======================================================
 
--- 生成 TOC
-function M.update()
-  local target_file = config.options.filename
-  if vim.fn.expand('%:t') ~= target_file then return end
+local function scan_to_tree_node(path, rel_base)
+  local handle = vim.loop.fs_scandir(path)
+  if not handle then return {} end
+  local children = {}
+  while true do
+    local name, type = vim.loop.fs_scandir_next(handle)
+    if not name then break end
+    local is_dir = (type == "directory")
+    local rel_path = (rel_base == "" and name or rel_base .. "/" .. name)
+    local full_path = path .. "/" .. name
+    local skip = false
 
-  local files = vim.fn.glob('**/*.md', true, true)
-  local tree = {}
-  
-  for _, filepath in ipairs(files) do
-    if filepath ~= target_file and not string.match(filepath, "/%.") then
-      local dir = vim.fn.fnamemodify(filepath, ':h')
-      if dir == '.' then dir = '📂 根目录' end
-      if not tree[dir] then tree[dir] = {} end
-      table.insert(tree[dir], filepath)
+    if name == config.options.filename then skip = true end
+    if not config.options.behavior.filters.show_hidden and name:match("^%.") then skip = true end
+    if is_dir and vim.tbl_contains(config.options.behavior.filters.exclude_dirs, name) then skip = true end
+
+    if not skip then
+      local node = { name = name, type = is_dir and "dir" or "file", path = full_path, rel = rel_path, children = {} }
+      if is_dir then node.children = scan_to_tree_node(full_path, rel_path) end
+      table.insert(children, node)
     end
   end
-
-  local lines = {}
-  table.insert(lines, '# ' .. config.options.title)
-  table.insert(lines, '')
-
-  local keys = config.options.keymaps or config.defaults.keymaps
-  local help_text = string.format(
-    '> [yy]复制 [dd]剪切 [p]粘贴 [x]删 [r]改名 [n]新建 [R]刷新'
-  )
-  table.insert(lines, help_text)
-  
-  if clipboard.action then
-    local action_name = clipboard.action == "copy" and "复制" or "移动"
-    table.insert(lines, string.format('> 📌 剪贴板: %s "%s"', action_name, clipboard.filename))
-  end
-  
-  table.insert(lines, '')
-
-  local dirs = {}
-  for dir, _ in pairs(tree) do table.insert(dirs, dir) end
-  table.sort(dirs)
-
-  for _, dir in ipairs(dirs) do
-    table.insert(lines, '## ' .. dir)
-    local dir_files = tree[dir]
-    table.sort(dir_files)
-    for _, path in ipairs(dir_files) do
-      local filename = vim.fn.fnamemodify(path, ':t:r')
-      table.insert(lines, string.format('- [%s](./%s)', filename, path))
-    end
-    table.insert(lines, '')
-  end
-
-  local bufnr = vim.api.nvim_get_current_buf()
-  
-  -- 使用包装器更新内容
-  modify_buffer(bufnr, function()
-    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-  end)
+  table.sort(children, function(a, b) if a.type ~= b.type then return a.type == "dir" else return a.name < b.name end end)
+  return children
 end
 
--- [yy] 复制
-function M.yank()
-  local path, name = utils.get_path_under_cursor()
-  if not path then return end
-
-  clipboard = { action = "copy", path = path, filename = name }
-  utils.notify("📋 已复制: " .. name .. " (按 p 粘贴)")
-  M.update()
-end
-
--- [dd] 剪切 (视觉删除)
-function M.cut()
-  local path, name = utils.get_path_under_cursor()
-  if not path then return end
-
-  clipboard = { action = "move", path = path, filename = name }
-  
-  -- 使用包装器删除当前行
-  local bufnr = vim.api.nvim_get_current_buf()
-  modify_buffer(bufnr, function()
-    vim.api.nvim_del_current_line()
-  end)
-  
-  utils.notify("✂️ 已剪切: " .. name .. " (按 p 移动，按 R 撤销)")
-end
-
--- [x] 物理删除
-function M.delete()
-  local path, name = utils.get_path_under_cursor()
-  if not path then return end
-
-  local choice = vim.fn.confirm("🗑️ 永久删除: " .. name .. " ?", "&Yes\n&No", 2)
-  if choice == 1 then
-    if os.remove(path) then
-      -- 使用包装器删除行
-      local bufnr = vim.api.nvim_get_current_buf()
-      modify_buffer(bufnr, function()
-        vim.api.nvim_del_current_line()
-      end)
-      
-      utils.notify("🗑️ 已物理删除: " .. name)
-      if clipboard.path == path then clipboard = {} end
-      M.update()
+local function render_tree_recursive(nodes, indent_level, lines, map)
+  local indent = string.rep("  ", indent_level)
+  local icons = config.options.icons
+  for _, node in ipairs(nodes) do
+    local line_text = ""
+    if node.type == "dir" then
+      line_text = string.format("%s- %s%s/", indent, icons.dir, node.name)
     else
-      utils.notify("❌ 删除失败", vim.log.levels.ERROR)
-    end
-  end
-end
-
--- 执行粘贴 IO
-local function execute_paste(dest_path)
-  local src = clipboard.path
-  
-  if clipboard.action == "copy" then
-    local success, err = utils.copy_file(src, dest_path)
-    if success then
-      utils.notify("✅ 复制成功: " .. dest_path)
-      M.update()
-    else
-      utils.notify("❌ 复制失败: " .. (err or ""), vim.log.levels.ERROR)
-    end
-
-  elseif clipboard.action == "move" then
-    if vim.fn.filereadable(src) == 0 then
-      utils.notify("❌ 源文件已不存在", vim.log.levels.ERROR)
-      return
-    end
-
-    local success, err = os.rename(src, dest_path)
-    if success then
-      utils.notify("✅ 移动成功: " .. dest_path)
-      clipboard = {} 
-      M.update()
-    else
-      utils.notify("❌ 移动失败: " .. (err or ""), vim.log.levels.ERROR)
-    end
-  end
-end
-
--- [p] 粘贴
-function M.paste()
-  if not clipboard.path or not clipboard.action then
-    utils.notify("⚠️ 剪贴板为空", vim.log.levels.WARN)
-    return
-  end
-
-  local target_ref_path, _ = utils.get_path_under_cursor()
-  local target_dir
-  if target_ref_path then
-    target_dir = utils.get_dir_from_path(target_ref_path)
-  else
-    local line = vim.api.nvim_get_current_line()
-    if line:match("^##%s+") then
-       utils.notify("⚠️ 请将光标移到目标目录下的【任意文件】上", vim.log.levels.WARN)
-       return
-    else
-       utils.notify("⚠️ 无法确定粘贴位置，请移到目标文件上", vim.log.levels.WARN)
-       return
-    end
-  end
-
-  local dest_path = target_dir .. "/" .. clipboard.filename
-
-  if vim.fn.filereadable(dest_path) == 1 then
-    utils.input("文件已存在，重命名为: ", "copy_" .. clipboard.filename, function(new_name)
-      if new_name and new_name ~= "" then
-        local new_dest = target_dir .. "/" .. new_name
-        execute_paste(new_dest)
+      local display_name = utils.get_stem(node.name)
+      local url = "./" .. node.rel:gsub(" ", "%%20")
+      line_text = string.format("%s- %s[%s](%s)", indent, icons.file, display_name, url)
+      if node.name:match("%.md$") then
+        local tags = utils.extract_tags(node.path)
+        if #tags > 0 then line_text = line_text .. config.options.behavior.tags.prefix .. table.concat(tags, ", ") .. "`" end
       end
-    end)
-  else
-    execute_paste(dest_path)
+    end
+    table.insert(lines, line_text)
+    map[#lines] = { path = node.path, type = node.type }
+    if node.type == "dir" then render_tree_recursive(node.children, indent_level + 1, lines, map) end
   end
 end
 
--- [r] 重命名
-function M.rename()
-  local path, name = utils.get_path_under_cursor()
-  if not path then return end
+function M.refresh(silent)
+  M.cwd = vim.fn.getcwd()
+  local tree = scan_to_tree_node(M.cwd, "")
+  local lines = {}
+  table.insert(lines, config.options.title)
+  table.insert(lines, "")
+  table.insert(lines, "> Root: `" .. M.cwd .. "`")
+  table.insert(lines, "> Help: `?`")
+  table.insert(lines, "---")
+  table.insert(lines, "")
 
-  utils.input("重命名: ", name, function(new_name)
-    if not new_name or new_name == "" or new_name == name then return end
-    
-    local dir = utils.get_dir_from_path(path)
-    local new_path = dir .. "/" .. new_name
-    
-    local success, err = os.rename(path, new_path)
-    if success then
-      utils.notify("✏️ 重命名成功")
-      M.update()
+  M.line_map = {}
+  render_tree_recursive(tree, 0, lines, M.line_map)
+
+  local bufnr = vim.api.nvim_get_current_buf()
+  if vim.fn.bufname(bufnr):match(config.options.filename .. "$") then
+    vim.bo[bufnr].modifiable = true
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+    vim.bo[bufnr].modifiable = false
+    vim.bo[bufnr].modified = false
+  end
+
+  local f = io.open(M.cwd .. "/" .. config.options.filename, "w")
+  if f then
+    for _, l in ipairs(lines) do f:write(l .. "\n") end
+    f:close()
+  end
+
+  if is_toc_buf then
+    vim.cmd("checktime")
+  end
+
+  if not silent then utils.notify("已刷新") end
+end
+
+-- =======================================================
+-- 2. 操作逻辑
+-- =======================================================
+
+function M.get_current_info()
+  local row = vim.api.nvim_win_get_cursor(0)[1]
+  local info = M.line_map[row]
+  if info then
+    local rel_path = utils.get_relative_path(M.cwd, info.path)
+    return info.path, info.type, rel_path
+  end
+  return nil, nil, nil
+end
+
+function M.action_delete()
+  local full_path, type, _ = M.get_current_info()
+  if not full_path then return end
+
+  -- [修改] 移除 confirm 确认，直接删除
+  local name = vim.fn.fnamemodify(full_path, ":t")
+  local trash_dir = utils.ensure_trash_dir(M.cwd)
+  local timestamp = os.date("%Y%m%d_%H%M%S")
+  local trash_name = name .. "_" .. timestamp
+  if type == "file" then
+    trash_name = name:gsub("(%.%w+)$", "") .. "_" .. timestamp .. name:match("(%.%w+)$")
+  end
+  local trash_path = trash_dir .. "/" .. trash_name
+
+  if os.rename(full_path, trash_path) then
+    utils.notify("🗑️ 已删除: " .. name)
+    M.refresh(true)
+  else
+    utils.notify("❌ 删除失败", vim.log.levels.ERROR)
+  end
+end
+
+function M.action_restore()
+  local trash_dir = M.cwd .. "/" .. config.options.behavior.trash_dir
+  local handle = vim.loop.fs_scandir(trash_dir)
+  if not handle then
+    utils.notify("回收站为空"); return
+  end
+  local files = {}
+  while true do
+    local name, type = vim.loop.fs_scandir_next(handle)
+    if not name then break end
+    local stat = vim.loop.fs_stat(trash_dir .. "/" .. name)
+    if stat then table.insert(files, { name = name, time = stat.mtime.sec }) end
+  end
+  if #files == 0 then
+    utils.notify("回收站为空"); return
+  end
+  table.sort(files, function(a, b) return a.time > b.time end)
+  local target_file = files[1].name
+  local original_name = target_file:gsub("_%d%d%d%d%d%d%d%d_%d%d%d%d%d%d", "")
+  local dest_path = M.cwd .. "/" .. original_name
+  if os.rename(trash_dir .. "/" .. target_file, dest_path) then
+    utils.notify("♻️ 已恢复: " .. original_name)
+    M.refresh(true)
+  end
+end
+
+function M.action_yank()
+  local _, type, rel_path = M.get_current_info()
+  if rel_path and type == "file" then
+    M.last_yank = rel_path
+    utils.notify("已记录源: " .. rel_path)
+  end
+end
+
+function M.action_paste()
+  if not M.last_yank then
+    utils.notify("请先 yy 复制"); return
+  end
+  local full_path, type, _ = M.get_current_info()
+  local dest_dir = M.cwd
+  if full_path then
+    if type == "dir" then
+      dest_dir = full_path
     else
-      utils.notify("❌ 重命名失败: " .. (err or ""), vim.log.levels.ERROR)
+      dest_dir = vim.fn.fnamemodify(full_path, ":h")
+    end
+  end
+  local old_name = vim.fn.fnamemodify(M.last_yank, ":t")
+  utils.input("Copy as: ", "copy_" .. old_name, function(new_name)
+    if not new_name or new_name == "" then return end
+    local src_path = M.cwd .. "/" .. M.last_yank:sub(3)
+    local dest_path = dest_dir .. "/" .. new_name
+    if utils.copy_file(src_path, dest_path) then
+      utils.notify("✅ 已复制: " .. new_name)
+      M.refresh(true)
     end
   end)
 end
 
--- [n] 新建
-function M.create()
-  local target_ref_path, _ = utils.get_path_under_cursor()
-  local base_dir = target_ref_path and utils.get_dir_from_path(target_ref_path) or "."
-
-  utils.input("新建 (输入 x.md 或 dir/x.md): ", "", function(input_name)
-    if not input_name or input_name == "" then return end
-    
-    local full_path = base_dir .. "/" .. input_name
-    
-    if input_name:match("/$") then
-       if vim.fn.isdirectory(full_path) == 1 then
-         utils.notify("目录已存在", vim.log.levels.WARN)
-       else
-         vim.fn.mkdir(full_path, "p")
-         utils.notify("📁 目录已创建: " .. full_path)
-         M.update()
-       end
-       return
-    end
-
-    local parent_dir = vim.fn.fnamemodify(full_path, ":h")
-    if vim.fn.isdirectory(parent_dir) == 0 then
-      vim.fn.mkdir(parent_dir, "p")
-    end
-
-    if vim.fn.filereadable(full_path) == 1 then
-      utils.notify("⚠️ 文件已存在", vim.log.levels.WARN)
-      return
-    end
-
-    local file = io.open(full_path, "w")
-    if file then
-      file:write("# " .. vim.fn.fnamemodify(full_path, ":t:r") .. "\n")
-      file:close()
-      utils.notify("✅ 文件已创建: " .. input_name)
-      M.update()
+function M.create_new()
+  local full_path, type, _ = M.get_current_info()
+  local base_dir = M.cwd
+  if full_path then
+    if type == "dir" then
+      base_dir = full_path
     else
-      utils.notify("❌ 创建失败", vim.log.levels.ERROR)
+      base_dir = vim.fn.fnamemodify(full_path, ":h")
+    end
+  end
+  utils.input("New (file.md or dir/): ", "", function(input)
+    if not input or input == "" then return end
+    local new_full = base_dir .. "/" .. input
+    if input:match("/$") then
+      vim.fn.mkdir(new_full, "p")
+    else
+      if not input:match("%.%w+$") then new_full = new_full .. ".md" end
+      local f = io.open(new_full, "w")
+      if f then
+        f:write("# " .. vim.fn.fnamemodify(new_full, ":t:r") .. "\n"); f:close()
+      end
+    end
+    M.refresh(true)
+  end)
+end
+
+function M.rename_item()
+  local full_path, _, _ = M.get_current_info()
+  if not full_path then return end
+  local old_name = vim.fn.fnamemodify(full_path, ":t")
+  utils.input("Rename: ", old_name, function(new_name)
+    if new_name and new_name ~= "" and new_name ~= old_name then
+      local dir = vim.fn.fnamemodify(full_path, ":h")
+      os.rename(full_path, dir .. "/" .. new_name)
+      M.refresh(true)
     end
   end)
 end
